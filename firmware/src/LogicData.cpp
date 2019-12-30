@@ -1,6 +1,9 @@
 #include "Arduino.h"
 #include "LogicData.h"
 
+// Copyright (c) 2017 Phil Hord
+// MIT License
+
 // Expect 1 bit per millisecond
 #define SAMPLE_RATE 1000
 
@@ -67,8 +70,10 @@ bool mque::peek(index_t index, micros_t * t)
 //------------------------------------------------------
 
 void LogicData::Begin() {
-  pinMode(tx_pin, OUTPUT);
-  SendBit(MARK); // IDLE-CLOSED
+  if(tx_pin != NULL) {
+    pinMode(tx_pin, OUTPUT);
+    SendBit(MARK); // IDLE-CLOSED
+  }
 }
 
 void LogicData::PinChange(bool level) {
@@ -255,7 +260,9 @@ const char * LogicData::Decode(uint32_t msg) {
 
 // Transmit
 void LogicData::SendBit(bool bit) {
-  digitalWrite(tx_pin, bit);
+  if(tx_pin != NULL) {
+    digitalWrite(tx_pin, bit);
+  }
 }
 
 void LogicData::MicroDelay(micros_t us) {

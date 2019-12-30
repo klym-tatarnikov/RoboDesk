@@ -1,5 +1,9 @@
 //////////////////////////////////////////////////////////
 //
+// https://github.com/phord/RoboDesk
+// Copyright (c) 2017 Phil Hord
+// MIT License
+//
 // LOGICDATA protocol - Used by motorized office furniture from LogicData.
 //
 // 32-bit words
