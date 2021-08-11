@@ -1,13 +1,24 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoOTA.h>
+#include <CREDENTIALS.h>
+
 #include "pins.h"
 #include "LogicData.h"
 
 
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof(array[0]))
+#define CYCLE_TIME_US 1000  // 1 ms
 
 int btn_pins[] = {BTN_UP, BTN_DOWN};
 const int btn_pressed_state = HIGH;// when we read high, button is pressed
 const uint32_t debounce_time = 50;
 const uint32_t double_time = 500;
+
+enum Actions { UpSingle, UpDouble, DownSingle, DownDouble };
+bool latch_up = false;
+bool latch_down = false;
 
 #define BTN_COUNT ARRAY_SIZE(btn_pins)
 int8_t btn_last_state[BTN_COUNT] = {-1};
@@ -23,17 +34,156 @@ uint32_t signal_giveup_time = 2000;
 
 
 LogicData ld(-1);
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+volatile unsigned long gCurTimeUs = 0;
+volatile unsigned long gLastTimeUs = 0;
 
 //-- Buffered mode parses input words and sends them to output separately
 void ICACHE_RAM_ATTR logicDataPin_ISR() {
   ld.PinChange(HIGH == digitalRead(LOGICDATA_RX));
 }
 
-uint8_t highTarget = 41;
-uint8_t lowTarget = 28;
+uint8_t highTarget = 120;
+uint8_t lowTarget = 80;
 
-uint8_t height;
+volatile uint8_t height;
 uint8_t target;
+
+bool checkTime()
+{
+    gCurTimeUs = micros();
+    if (gCurTimeUs - gLastTimeUs >= CYCLE_TIME_US)
+    {
+        gLastTimeUs = gCurTimeUs;
+        return true;
+    }
+    return false;
+}
+
+
+void callback(char *topic, byte *payload, unsigned int length)
+{
+    String receivedtopic = topic;
+    int gTargetHeight;
+
+    String value = "";
+    for (unsigned int i = 0; i < length; i++)
+    {
+        value += (char)payload[i];
+    }
+
+    if (receivedtopic == "deskcontrol/setheight")
+    {
+       gTargetHeight = value.toInt();
+       if (gTargetHeight>height)
+       {
+          latch_up = true;
+          target = gTargetHeight;
+          last_signal = millis();
+       }
+       if (gTargetHeight<height)
+       {
+          latch_down = true;
+          target = gTargetHeight;
+          last_signal = millis();
+       }
+          
+    }
+}
+
+void initWiFi()
+{
+    WiFi.mode(WIFI_STA);
+    WiFi.persistent(false);
+    WiFi.config(ip, dns, gateway, subnet);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASS); //Connect to the WiFi network
+}
+
+void initOTA()
+{
+    ArduinoOTA.onStart([]() {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH)
+            type = "sketch";
+        else // U_SPIFFS
+            type = "filesystem";
+
+        // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+        Serial.println("Start updating " + type);
+    });
+    ArduinoOTA.onEnd([]() {
+        Serial.println("\nEnd");
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("Error[%u]: ", error);
+        if (error == OTA_AUTH_ERROR)
+            Serial.println("Auth Failed");
+        else if (error == OTA_BEGIN_ERROR)
+            Serial.println("Begin Failed");
+        else if (error == OTA_CONNECT_ERROR)
+            Serial.println("Connect Failed");
+        else if (error == OTA_RECEIVE_ERROR)
+            Serial.println("Receive Failed");
+        else if (error == OTA_END_ERROR)
+            Serial.println("End Failed");
+    });
+    ArduinoOTA.begin();
+}
+
+long lastReconnectAttempt = 0;
+boolean mqttReconnect()
+{
+    if (client.connect("DeskClient"))
+    {
+        client.subscribe("deskcontrol/setheight");
+    }
+    return client.connected();
+}
+
+void initMQTT()
+{
+    if (!client.connected())
+    {
+        long now = millis();
+        if (now - lastReconnectAttempt > 5000)
+        {
+            lastReconnectAttempt = now;
+            // Attempt to reconnect
+            if (mqttReconnect())
+            {
+                lastReconnectAttempt = 0;
+            }
+        }
+    }
+    else
+    {
+        // Client connected
+
+        client.loop();
+    }
+}
+
+long lastPublish = 0;
+byte lastHeight = 0;
+void publishHeight()
+{
+    long now = millis();
+    if (lastHeight != height && now - lastPublish > 5000)
+    {
+        lastPublish = now;
+        lastHeight = height;
+        char heightBuffer[3];
+        sprintf(heightBuffer, "%d", height);
+        client.publish("deskcontrol/currentheight", heightBuffer, true);
+    }
+}
+
 
 void setup() {
 
@@ -50,8 +200,15 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(LOGICDATA_RX), logicDataPin_ISR, CHANGE);
 
   ld.Begin();
+  initWiFi();
+  initOTA();
 
-  Serial.println("Robodesk v2.x  build: " __DATE__ " " __TIME__);
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+  lastReconnectAttempt = 0;
+  gLastTimeUs = micros();
+
+  Serial.println("Robodesk v2.1  build: " __DATE__ " " __TIME__);
 }
 
 // Record last time the display changed
@@ -79,9 +236,7 @@ void check_display() {
     last_signal = millis();
 }
 
-enum Actions { UpSingle, UpDouble, DownSingle, DownDouble };
-bool latch_up = false;
-bool latch_down = false;
+
 
 void transitionState(enum Actions action) {
   switch(action) {
@@ -158,6 +313,10 @@ void move() {
 
 
 void loop() {
+
+  ArduinoOTA.handle();
+  initMQTT();
+
   // sets global height and last_signal from logicdata serial
   check_display();
 
@@ -185,5 +344,8 @@ void loop() {
       }// endif pressed
     }
   }
+  
   move();
+  publishHeight();
+
 }
